@@ -71,8 +71,11 @@ parser.add_argument('--use_raw_train', action='store_true',help='using 1200x1600
 parser.add_argument('--split', type=str, default='intermediate', help='intermediate or advanced')
 parser.add_argument('--attn_temp', type=float, default=2)
 parser.add_argument('--mono_sampling', default=True, help='mono depth guide depth sampling')
+parser.add_argument('--disable_mono_sampling', action='store_true', help='MVS-only ablation')
 parser.add_argument('--edge_guide', default=True, help='edge guide mono_sampling')
 parser.add_argument('--attention', default=True, help='pyramid mono feature')
+parser.add_argument('--trust_mode', choices=['always', 'learned'], default='learned',
+                    help='checkpoint trust configuration')
 
 # parse arguments and check
 args = parser.parse_args()
@@ -393,9 +396,10 @@ def save_scene_depth(testlist):
                     inverse_depth=args.inverse_depth,
                     agg_type=args.agg_type,
                     attn_temp=args.attn_temp,
-                    mono_sampling=args.mono_sampling,
+                    mono_sampling=args.mono_sampling and not args.disable_mono_sampling,
                     edge_guide=args.edge_guide,
                     attention=args.attention,
+                    trust_mode=args.trust_mode,
                     max_h=832,
                     max_w=args.max_w,
                 )

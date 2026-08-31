@@ -1,112 +1,245 @@
-# **MonoMVSNet**
+# MoonNet
 
-## [Arxiv](https://arxiv.org/abs/2507.11333) | [Pretrained Models](https://drive.google.com/drive/folders/1xf01LEp0IvEgFBhXxTq0jY4Duo7eiRJG?usp=drive_link)
+**Learning to Trust Monocular Candidate Injection for Multi-View Stereo**
 
-> MonoMVSNet: Monocular Priors Guided Multi-View Stereo Network  
-> Authors: Jianfei Jiang, Qiankun Liu*, Haochen Yu, Hongyuan Liu, Liyong Wang, Jiansheng Chen, Huimin Ma*   
-> Institute: University of Science and Technology Beijing  
-> ICCV 2025  
+MoonNet is a research branch built on [MonoMVSNet](https://github.com/JianfeiJ/MonoMVSNet) (ICCV 2025). It studies one focused question:
 
-## 😀Abstract
-Learning-based Multi-View Stereo (MVS) methods aim to predict depth maps for a sequence of calibrated images to recover dense point clouds. However, existing MVS methods often struggle with challenging regions, such as textureless regions and reflective surfaces, where feature matching fails. In contrast, monocular depth estimation inherently does not require feature matching, allowing it to achieve robust relative depth estimation in these regions. To bridge this gap, we propose MonoMVSNet, a novel monocular feature and depth guided MVS network that integrates powerful priors from a monocular foundation model into multi-view geometry. Firstly, the monocular feature of the reference view is integrated into source view features by the attention mechanism with a newly designed cross-view position encoding. Then, the monocular depth of the reference view is aligned to dynamically update the depth candidates for edge regions during the sampling procedure. Finally, a relative consistency loss is further designed based on the monocular depth to supervise the depth prediction. Extensive experiments demonstrate that MonoMVSNet achieves state-of-the-art performance on the DTU and Tanks-and-Temples datasets, ranking first on the Tanks-and-Temples Intermediate and Advanced benchmarks.
+> When should a multi-view stereo network trust an aligned monocular depth prior?
 
-<p align="center">
-<img src="assets/overview.png" width="100%">
-</p>
+MonoMVSNet injects an aligned monocular depth candidate at valid edge pixels during cascade sampling. MoonNet keeps that design and adds a lightweight reliability gate that learns how strongly each candidate should be injected.
 
-## 🚀Installation
+## Status
+
+This repository contains a research implementation, not a paper release with verified benchmark claims.
+
+- Implemented: reliability gate, differentiable soft candidate injection, supervised trust loss, training/inference flags and unit tests.
+- Statically verified: Python compilation succeeds.
+- Not yet verified in this repository: full DTU training, DTU point-cloud scores, BlendedMVS fine-tuning, Tanks and Temples scores, runtime and peak VRAM.
+
+Do not treat the original MonoMVSNet numbers below or any planned MoonNet targets as newly reproduced results.
+
+The complete hypothesis, method boundary, experiment matrix and go/no-go criteria are documented in [docs/research-plan.md](docs/research-plan.md).
+
+## Method
+
+For cascade stages 2–4, let:
+
+- `h` be the original inverse-depth candidate selected for possible replacement;
+- `m` be the aligned monocular inverse-depth candidate;
+- `r` be the predicted trust score in `[0, 1]`.
+
+MoonNet performs soft candidate injection:
+
+```text
+h_new = h + r * (m - h)
+```
+
+- `r = 1` reproduces the original MonoMVSNet candidate replacement;
+- `r = 0` preserves the original MVS candidate;
+- intermediate values reduce the effect of uncertain priors.
+
+The gate uses four observable signals:
+
+1. relative disagreement between aligned monocular and coarse MVS inverse depth;
+2. coarse-stage photometric confidence;
+3. reference-view edge response;
+4. the monocular candidate's normalized offset from the current inverse-depth interval center.
+
+The first cascade stage remains unchanged because no previous metric MVS estimate is available yet.
+
+### Training target
+
+During training, the gate receives a soft oracle target derived from which candidate is closer to ground-truth depth:
+
+```text
+target = sigmoid((base_error - mono_error) / (temperature * depth_interval))
+```
+
+The total objective is the original MonoMVSNet loss plus a weighted trust loss.
+
+## Repository changes
+
+```text
+models/trust.py             reliability gate and trust supervision
+models/module.py            soft candidate injection and supervision metadata
+models/monomvsnet.py        gate integration and trust loss
+train_dtu.py                DTU training flags and logging
+train_bld.py                BlendedMVS fine-tuning flags and logging
+test_*.py                   checkpoint-compatible trust configuration
+tests/test_trust.py         degeneration, shape and gradient checks
+docs/research-plan.md       research and experiment plan
+```
+
+## Installation
+
+The upstream environment is retained:
 
 ```bash
-conda create -n monomvsnet python=3.10.8
-conda activate monomvsnet
+conda create -n moonnet python=3.10.8
+conda activate moonnet
 pip install -r requirements.txt
 ```
-To reproduce the GPU memory consumption described in the paper, you need install `xformers`.
 
-## ⭐Data Preparation
+Install `xformers` separately if you need to reproduce the memory-efficient attention setting used by MonoMVSNet.
 
-Please refer to [RRT-MVS](https://github.com/JianfeiJ/RRT-MVS).
+## Pretrained components
 
-You need download pretrained weights [depth_anything_v2_vits](https://drive.google.com/file/d/1M1JQWZ9jEa1H0lblt3B6yJU_LyjqF60_/view?usp=drive_link) and [TEED_model](https://drive.google.com/file/d/1j8wRHMozt_eJwBjs1JXxTDRboP_lKiSp/view?usp=drive_link) , then place them in the folder `pre_trained_weights`
+Download the upstream pretrained weights:
 
+- [Depth Anything V2 ViT-S](https://drive.google.com/file/d/1M1JQWZ9jEa1H0lblt3B6yJU_LyjqF60_/view?usp=drive_link)
+- [TEED](https://drive.google.com/file/d/1j8wRHMozt_eJwBjs1JXxTDRboP_lKiSp/view?usp=drive_link)
 
-## 🦴Training
+Place them under:
 
-### Training on DTU
-
-To train the model on DTU, specify ``DTU_TRAINING`` in ``./scripts/train_dtu.sh`` first and then run:
-```
-bash scripts/train_dtu.sh
-```
-After training, you will get model checkpoints in `./checkpoints/dtu`.
-
-### Finetune on BlendedMVS
-
-To fine-tune the model on BlendedMVS, you need specify `BLD_TRAINING` and `BLD_CKPT_FILE` in `./scripts/train_bld.sh` first, then run:
-```
-bash scripts/train_bld.sh
-```
-After finetuning, you will get model checkpoints in `./checkpoints/bld_ft`.
-
-
-## 👀Testing
-
-### Testing on DTU
-
-For DTU testing, we use the model ([dtu_best](https://drive.google.com/file/d/1npene4ESp3iep5rwmCavef1csUQxEyng/view?usp=drive_link)) trained on DTU training dataset, place it in the folder `./checkpoints/dtu`. Specify `DTU_TESTPATH` and `DTU_CKPT_FILE` in `./scripts/test_dtu.sh` first, then run the following command to generate point cloud results.
-```
-bash scripts/test_dtu_dypcd.sh
-```
-For ablation study of Table 3, we use:
-```
-bash scripts/test_dtu_pcd.sh
+```text
+pre_trained_weights/
+├── depth_anything_v2_vits.pth
+└── TEED_model.pth
 ```
 
-### Testing on Tanks and Temples
-We recommend using the finetuned model ([bld_best](https://drive.google.com/file/d/1fkprHMlk7MA4gFdL80wIC7wYlBkyj7ao/view?usp=drive_link)) to test on Tanks and Temples benchmark, place it in the folder `./checkpoints/bld_ft`. Similarly, specify `TNT_TESTPATH` and `TNT_CKPT_FILE` in `scripts/test_tnt_inter.sh` and `scripts/test_tnt_adv.sh`. To generate point cloud results, just run:
+For initializing from MonoMVSNet, use the upstream [pretrained models](https://drive.google.com/drive/folders/1xf01LEp0IvEgFBhXxTq0jY4Duo7eiRJG?usp=drive_link). When `--trust_mode learned` is enabled, the loader accepts the missing MoonNet gate parameters and initializes them locally.
+
+## Data preparation
+
+Use the same prepared DTU, BlendedMVS and Tanks and Temples layouts as MonoMVSNet. The upstream project refers to [RRT-MVS](https://github.com/JianfeiJ/RRT-MVS) for preparation details.
+
+Before running the shell scripts, replace their placeholder or author-local dataset paths:
+
+```text
+scripts/train_dtu.sh
+scripts/train_bld.sh
+scripts/test_dtu_dypcd.sh
+scripts/test_dtu_pcd.sh
+scripts/test_tnt_inter.sh
+scripts/test_tnt_adv.sh
 ```
-bash scripts/test_tnt_inter.sh
+
+## Training
+
+### MoonNet on DTU
+
+After editing `DTU_TRAINING` in `scripts/train_dtu.sh`:
+
+```bash
+bash scripts/train_dtu.sh _moon \
+  --trust_mode learned \
+  --trust_loss_weight 0.1 \
+  --trust_temperature 1.0
 ```
+
+### MonoMVSNet-compatible control
+
+Use `always` to disable the learned gate and reproduce the original unconditional candidate replacement path:
+
+```bash
+bash scripts/train_dtu.sh _always --trust_mode always
 ```
-bash scripts/test_tnt_adv.sh
-``` 
-For quantitative evaluation, you can upload your point clouds to [Tanks and Temples benchmark](https://www.tanksandtemples.org/).
 
-## 💪**Results**
+For the MVS-only sampling ablation, disable monocular candidate injection while retaining the rest of the architecture:
 
-### **Quantitative Results on DTU**
+```bash
+bash scripts/train_dtu.sh _mvs_only --disable_mono_sampling --trust_mode always
+```
 
+### Fine-tune on BlendedMVS
 
-| DTU | Acc. ↓ | Comp. ↓ | Overall ↓ |
-|:---:|:------:|:-------:|:---------:|
-| Ours (N=5) | 0.313 | 0.243 | 0.278 |
-| Ours (N=9) | 0.302 | 0.248 | 0.275 |
+After editing `BLD_TRAINING` and `BLD_CKPT_FILE` in `scripts/train_bld.sh`:
 
----
-### **Quantitative Results on Tanks-and-Temples**
+```bash
+bash scripts/train_bld.sh _moon \
+  --trust_mode learned \
+  --trust_loss_weight 0.1 \
+  --trust_temperature 1.0
+```
 
-| Inter. | Mean ↑ | Family | Francis | Horse | Lighthouse | M60 | Panther | Playground | Train |
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| Ours | 68.63 | 82.38 | 72.89 | 62.80 | 70.49 | 65.79 | 68.54 | 65.54 | 60.59 |
+## Evaluation
 
+### DTU dynamic fusion
 
-| Adv. | Mean ↑ | Auditorium | Ballroom | Courtroom | Museum | Palace | Temple |
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| Ours | 43.58 | 30.33 | 46.76 | 42.90 | 56.31 | 37.28 | 47.88 |
+Edit the paths in `scripts/test_dtu_dypcd.sh`, then run:
 
+```bash
+bash scripts/test_dtu_dypcd.sh _moon --trust_mode learned
+```
 
-## 🤝Citation
-If you find this work useful in your research, please consider citing the following:
+### DTU fixed fusion control
+
+```bash
+bash scripts/test_dtu_pcd.sh _moon --trust_mode learned
+```
+
+### Tanks and Temples
+
+Edit the dataset and checkpoint paths in the corresponding scripts:
+
+```bash
+bash scripts/test_tnt_inter.sh _moon --trust_mode learned
+bash scripts/test_tnt_adv.sh _moon --trust_mode learned
+```
+
+For official MonoMVSNet checkpoints without gate parameters, instantiate with `--trust_mode always`. MoonNet checkpoints must be evaluated with `--trust_mode learned`.
+
+## Self-checks
+
+Run syntax compilation:
+
+```bash
+python -m compileall -q models train_dtu.py train_bld.py test_dtu_dypcd.py \
+  test_dtu_pcd.py test_dypcd_tnt_inter.py test_dypcd_tnt_adv.py tests
+```
+
+Run the focused tests after PyTorch and the project requirements are installed:
+
+```bash
+python -m unittest tests.test_trust -v
+```
+
+The tests check:
+
+- initial gate output and gradient flow;
+- finite trust-loss gradients;
+- `trust = 1` equivalence to original MonoMVSNet replacement;
+- `trust = 0` equivalence to unmodified MVS candidates;
+- supervision metadata shapes and masks.
+
+## Required experiments before making research claims
+
+At minimum, compare:
+
+| Experiment | Monocular sampling | Trust mode |
+|---|---:|---|
+| MVS-only control | disabled | n/a |
+| MonoMVSNet | enabled | `always` |
+| MoonNet | enabled | `learned` |
+
+Report standard geometry metrics together with candidate quantization error, candidate coverage, gate discrimination/calibration, additional parameters, peak VRAM and latency. Controlled prior corruptions must be labeled as synthetic stress tests rather than natural-scene results.
+
+## Upstream reference results
+
+The following are quoted from the upstream README and are **not reproduced by this branch**:
+
+| Dataset / setting | Reported upstream result |
+|---|---:|
+| DTU Overall, 5 views | 0.278 mm |
+| DTU Overall, 9 views | 0.275 mm |
+| Tanks and Temples Intermediate | 68.63 F-score |
+| Tanks and Temples Advanced | 43.58 F-score |
+
+## Acknowledgements
+
+MoonNet is derived from [JianfeiJ/MonoMVSNet](https://github.com/JianfeiJ/MonoMVSNet), which in turn acknowledges ET-MVSNet, TransMVSNet, MVSFormer++, Depth Anything V2 and TEED. The original license is retained in [LICENSE](LICENSE).
+
+Please cite MonoMVSNet when using this codebase:
+
 ```bibtex
 @inproceedings{monomvsnet,
-    author    = {Jiang, Jianfei and Liu, Qiankun and Yu, Haochen and Liu, Hongyuan and Wang, Liyong and Chen, Jiansheng and Ma, Huimin},
-    title     = {MonoMVSNet: Monocular Priors Guided Multi-View Stereo Network},
-    booktitle = {Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},
-    month     = {October},
-    year      = {2025},
-    pages     = {27806-27816}
+  author    = {Jiang, Jianfei and Liu, Qiankun and Yu, Haochen and Liu, Hongyuan and Wang, Liyong and Chen, Jiansheng and Ma, Huimin},
+  title     = {MonoMVSNet: Monocular Priors Guided Multi-View Stereo Network},
+  booktitle = {Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},
+  month     = {October},
+  year      = {2025},
+  pages     = {27806--27816}
 }
 ```
 
-## 🫶Acknowledgements
-Our work is partially based on these opening source works [ET-MVSNet](https://github.com/TQTQliu/ET-MVSNet), [TransMVSNet](https://github.com/megvii-research/TransMVSNet), [MVSFormer++](https://github.com/maybeLx/MVSFormerPlusPlus), [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2), and [TEED](https://github.com/xavysp/TEED). We appreciate their contributions to the MVS community.
+No MoonNet paper citation is provided yet because no paper has been published.

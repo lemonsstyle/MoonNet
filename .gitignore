@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+pre_trained_weights/
+checkpoints/
+outputs/
+runs/
+*.ckpt
+*.pth
+
+.DS_Store

@@ -190,7 +190,7 @@ def schedule_inverse_range(inverse_min_depth, inverse_max_depth, ndepths, H, W):
     return 1. / inverse_depth_hypo
 
 def schedule_inverse_range_mono(inverse_min_depth, inverse_max_depth, ndepths, H, W, mono_depth, ref_edge, edge_thres,
-                                coarse_depth, confidence):
+                                coarse_depth, confidence, aligned_inverse_mono=None, trust_score=None):
     # cur_depth_min, (B, H, W)
     # cur_depth_max: (B, H, W)
 
@@ -202,7 +202,12 @@ def schedule_inverse_range_mono(inverse_min_depth, inverse_max_depth, ndepths, H
     inverse_depth_hypo = inverse_max_depth[:, None, :, :] + (inverse_min_depth - inverse_max_depth)[:, None, :,
                                                             :] * itv  # B D H W
 
-    inverse_mono_depth_scale = mono_depth_alignment(mono_depth, 1./coarse_depth.unsqueeze(1), confidence.unsqueeze(1), top_p=0.8)
+    if aligned_inverse_mono is None:
+        inverse_mono_depth_scale = mono_depth_alignment(
+            mono_depth, 1. / coarse_depth.unsqueeze(1), confidence.unsqueeze(1), top_p=0.8
+        )
+    else:
+        inverse_mono_depth_scale = aligned_inverse_mono
 
     inverse_mono_depth_scale_out = inverse_mono_depth_scale
 
@@ -234,19 +239,50 @@ def schedule_inverse_range_mono(inverse_min_depth, inverse_max_depth, ndepths, H
     # 将 idx 转换为 (B, H, W) 形状
     min_diff_idx = min_diff_idx.view(B, H // 2, W // 2)  # (B, H, W)
 
-    # 通过掩码操作替换深度
-    for b in range(B):
-        # 获取有效位置的 mask
-        valid_mask = valid_mono_mask[b]  # (H, W)
+    # Soft candidate injection. trust_score=None exactly preserves the original
+    # MonoMVSNet replacement, while zero trust keeps the MVS candidate intact.
+    base_candidate_inverse = torch.gather(
+        inverse_depth_hypo, 1, min_diff_idx.unsqueeze(1)
+    ).squeeze(1)
+    if trust_score is None:
+        trust_score_low = torch.ones_like(inverse_mono_depth_scale)
+    else:
+        trust_score_low = F.interpolate(
+            trust_score, size=(H // 2, W // 2), mode='bilinear', align_corners=False
+        ).squeeze(1).clamp(0.0, 1.0)
 
-        # 替换深度：对于每个有效的像素位置，更新为最接近的 inverse_mono_depth_scale
-        inverse_depth_hypo[b, min_diff_idx[b][valid_mask], valid_mask] = inverse_mono_depth_scale[b, valid_mask]
+    injected_candidate = base_candidate_inverse + trust_score_low * (
+        inverse_mono_depth_scale - base_candidate_inverse
+    )
+    replacement = torch.where(
+        valid_mono_mask, injected_candidate, base_candidate_inverse
+    )
+    inverse_depth_hypo = inverse_depth_hypo.scatter(
+        1, min_diff_idx.unsqueeze(1), replacement.unsqueeze(1)
+    )
 
     inverse_depth_hypo = F.interpolate(inverse_depth_hypo.unsqueeze(1), [ndepths, H, W], mode='trilinear',
                                        align_corners=True).squeeze(1)
     inverse_mono_depth_scale_out = F.interpolate(inverse_mono_depth_scale_out, size=(H, W), mode='bilinear', align_corners=True)
 
-    return 1. / inverse_depth_hypo, 1./inverse_mono_depth_scale_out
+    metadata = None
+    if trust_score is not None:
+        metadata = {
+            'trust_score': F.interpolate(
+                trust_score, size=(H, W), mode='bilinear', align_corners=False
+            ),
+            'trust_valid_mask': F.interpolate(
+                valid_mono_mask.unsqueeze(1).float(), size=(H, W), mode='nearest'
+            ).bool(),
+            'mono_candidate_depth': 1. / F.interpolate(
+                inverse_mono_depth_scale.unsqueeze(1), size=(H, W), mode='bilinear', align_corners=False
+            ).clamp_min(1e-6),
+            'base_candidate_depth': 1. / F.interpolate(
+                base_candidate_inverse.unsqueeze(1), size=(H, W), mode='bilinear', align_corners=False
+            ).clamp_min(1e-6),
+        }
+
+    return 1. / inverse_depth_hypo, 1. / inverse_mono_depth_scale_out, metadata
 
 
 def init_bn(module):

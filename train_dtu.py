@@ -62,8 +62,13 @@ parser.add_argument('--group_cor_dim', type=str, default="8,8,4,4", help='group 
 parser.add_argument('--inverse_depth', default=True, help='inverse depth')
 
 parser.add_argument('--mono_sampling', default=True, help='mono depth guide depth sampling')
+parser.add_argument('--disable_mono_sampling', action='store_true', help='MVS-only ablation')
 parser.add_argument('--edge_guide', default=True, help='edge guide mono_sampling')
 parser.add_argument('--attention', default=True, help='pyramid mono feature')
+parser.add_argument('--trust_mode', choices=['always', 'learned'], default='learned',
+                    help='always reproduces MonoMVSNet; learned enables MoonNet reliability gating')
+parser.add_argument('--trust_loss_weight', type=float, default=0.1, help='weight of the prior trust loss')
+parser.add_argument('--trust_temperature', type=float, default=1.0, help='soft oracle target temperature')
 parser.add_argument('--n_views', default=5, help='training views')
 
 parser.add_argument('--agg_type', type=str, default="ConvBnReLU3D", help='cost regularization type')
@@ -208,9 +213,11 @@ def train_sample(model, model_loss, optimizer, sample, args):
 
     depth_est = outputs["depth"]
 
-    loss, stage_ce_loss, stage_mono_loss, range_err_ratio = model_loss(
+    loss, stage_ce_loss, stage_mono_loss, stage_trust_loss, range_err_ratio = model_loss(
         outputs, depth_gt_ms, mask_ms, stage_lw=[float(e) for e in args.dlossw.split(",") if e],
-        inverse_depth=args.inverse_depth
+        inverse_depth=args.inverse_depth,
+        trust_loss_weight=args.trust_loss_weight,
+        trust_temperature=args.trust_temperature,
     )
     loss.backward()
     # for name, param in model.named_parameters():
@@ -227,6 +234,7 @@ def train_sample(model, model_loss, optimizer, sample, args):
                       "s1_mono_loss": stage_mono_loss[1],
                       "s2_mono_loss": stage_mono_loss[2],
                       "s3_mono_loss": stage_mono_loss[3],
+                      "trust_loss": sum(stage_trust_loss),
                       "s0_range_err_ratio": range_err_ratio[0],
                       "s1_range_err_ratio": range_err_ratio[1],
                       "s2_range_err_ratio": range_err_ratio[2],
@@ -269,9 +277,11 @@ def test_sample_depth(model, model_loss, sample, args):
     outputs = model_eval(sample_cuda["imgs"], sample_cuda["imgs_raw"], sample_cuda["proj_matrices"], sample_cuda["depth_values"])
     depth_est = outputs["depth"]
 
-    loss, stage_ce_loss, stage_mono_loss, range_err_ratio = model_loss(
+    loss, stage_ce_loss, stage_mono_loss, stage_trust_loss, range_err_ratio = model_loss(
         outputs, depth_gt_ms, mask_ms, stage_lw=[float(e) for e in args.dlossw.split(",") if e],
-        inverse_depth=args.inverse_depth
+        inverse_depth=args.inverse_depth,
+        trust_loss_weight=args.trust_loss_weight,
+        trust_temperature=args.trust_temperature,
     )
     scalar_outputs = {"loss": loss,
                       "s0_ce_loss": stage_ce_loss[0],
@@ -282,6 +292,7 @@ def test_sample_depth(model, model_loss, sample, args):
                       "s1_mono_loss": stage_mono_loss[1],
                       "s2_mono_loss": stage_mono_loss[2],
                       "s3_mono_loss": stage_mono_loss[3],
+                      "trust_loss": sum(stage_trust_loss),
                       "s0_range_err_ratio": range_err_ratio[0],
                       "s1_range_err_ratio": range_err_ratio[1],
                       "s2_range_err_ratio": range_err_ratio[2],
@@ -347,9 +358,10 @@ if __name__ == '__main__':
                     inverse_depth=args.inverse_depth,
                     agg_type=args.agg_type,
                     attn_temp=args.attn_temp,
-                    mono_sampling=args.mono_sampling,
+                    mono_sampling=args.mono_sampling and not args.disable_mono_sampling,
                     edge_guide=args.edge_guide,
                     attention=args.attention,
+                    trust_mode=args.trust_mode,
                     max_h=args.max_h,
                     max_w=args.max_w,
                     )
@@ -369,14 +381,16 @@ if __name__ == '__main__':
         loadckpt = os.path.join(args.logdir, saved_models[-1])
         print("resuming", loadckpt)
         state_dict = torch.load(loadckpt, map_location=torch.device("cpu"))
-        model.load_state_dict(state_dict['model'])
+        model.load_state_dict(state_dict['model'], strict=True)
         optimizer.load_state_dict(state_dict['optimizer'])
         start_epoch = state_dict['epoch'] + 1
     elif args.loadckpt:
         # load checkpoint file specified by args.loadckpt
         print("loading model {}".format(args.loadckpt))
         state_dict = torch.load(args.loadckpt, map_location=torch.device("cpu"))
-        model.load_state_dict(state_dict['model'])
+        load_result = model.load_state_dict(state_dict['model'], strict=args.trust_mode == 'always')
+        if args.trust_mode == 'learned':
+            print("checkpoint compatibility:", load_result)
 
     if (not is_distributed) or (dist.get_rank() == 0):
         print("start at epoch {}".format(start_epoch))

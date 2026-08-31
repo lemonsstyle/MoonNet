@@ -7,6 +7,7 @@ from models.module import *
 from models.depth_anything_v2.dpt import DepthAnythingV2
 from models.ted import TED
 from models.FMT_with_CVPE import FMT_with_pathway
+from models.trust import PriorTrustGate, prior_trust_loss
 
 class MonoMVSNet(nn.Module):
     def __init__(self, arch_mode="fpn", reg_net='reg2d', num_stage=4, fpn_base_channel=8,
@@ -19,6 +20,8 @@ class MonoMVSNet(nn.Module):
                  mono_sampling=True,
                  edge_guide=True,
                  attention=True,
+                 trust_mode='always',
+                 trust_initial=0.9,
                  max_h=512,
                  max_w=640,
                  ):
@@ -30,6 +33,11 @@ class MonoMVSNet(nn.Module):
         self.group_cor_dim = group_cor_dim
         self.inverse_depth = inverse_depth
         self.mono_sampling = mono_sampling
+        if trust_mode not in {'always', 'learned'}:
+            raise ValueError("trust_mode must be 'always' or 'learned'")
+        self.trust_mode = trust_mode
+        if self.mono_sampling and self.trust_mode == 'learned':
+            self.prior_trust_gate = PriorTrustGate(initial_trust=trust_initial)
         if self.mono_sampling:
             self.edge_guide = edge_guide
             self.edge_thres = 0.8
@@ -158,13 +166,35 @@ class MonoMVSNet(nn.Module):
                                                        depth_hypo_cvpe)
             else:
                 if self.mono_sampling:
-                    depth_hypo, mono_depth_scale = schedule_inverse_range_mono(
+                    aligned_inverse_mono = None
+                    trust_score = None
+                    if self.trust_mode == 'learned':
+                        aligned_inverse_mono = mono_depth_alignment(
+                            mono_depth,
+                            1. / outputs_stage['depth'].detach().unsqueeze(1),
+                            outputs_stage['photometric_confidence'].detach().unsqueeze(1),
+                            top_p=0.8,
+                        )
+                        trust_score = self.prior_trust_gate(
+                            aligned_inverse_mono,
+                            outputs_stage['depth'].detach(),
+                            outputs_stage['photometric_confidence'].detach(),
+                            ref_edge,
+                            outputs_stage['inverse_min_depth'].detach(),
+                            outputs_stage['inverse_max_depth'].detach(),
+                        )
+
+                    depth_hypo, mono_depth_scale, trust_metadata = schedule_inverse_range_mono(
                         outputs_stage['inverse_min_depth'].detach(),
                         outputs_stage['inverse_max_depth'].detach(),
                         self.stage_splits[stage_idx], H, W, mono_depth,
                         ref_edge, self.edge_thres, outputs_stage['depth'].detach(),
-                        outputs_stage['photometric_confidence'].detach())  # B D H W
+                        outputs_stage['photometric_confidence'].detach(),
+                        aligned_inverse_mono=aligned_inverse_mono,
+                        trust_score=trust_score,
+                    )  # B D H W
                 else:
+                    trust_metadata = None
                     depth_hypo = schedule_inverse_range(outputs_stage['inverse_min_depth'].detach(),
                                                         outputs_stage['inverse_max_depth'].detach(),
                                                         self.stage_splits[stage_idx], H, W)  # B D H W
@@ -177,6 +207,8 @@ class MonoMVSNet(nn.Module):
                                           split_itv=self.depth_interals_ratio[stage_idx])
 
             outputs_stage['mono_depth'] = mono_depth
+            if stage_idx > 0 and trust_metadata is not None:
+                outputs_stage.update(trust_metadata)
 
             outputs["stage{}".format(stage_idx + 1)] = outputs_stage
             outputs.update(outputs_stage)
@@ -191,7 +223,10 @@ def dtu_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
     total_loss = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
     stage_ce_loss = []
     stage_mono_loss = []
+    stage_trust_loss = []
     range_err_ratio = []
+    trust_loss_weight = kwargs.get("trust_loss_weight", 0.1)
+    trust_temperature = kwargs.get("trust_temperature", 1.0)
     for stage_idx, (stage_inputs, stage_key) in enumerate([(inputs[k], k) for k in inputs.keys() if "stage" in k]):
         depth_pred = stage_inputs['depth']
         depth_reg = stage_inputs['depth_reg']
@@ -220,19 +255,35 @@ def dtu_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
         # cross-entropy loss for all stages
         this_stage_ce_loss = cross_entropy_loss(mask, hypo_depth, depth_gt, attn_weight)
 
+        if 'trust_score' in stage_inputs:
+            candidate_interval = (hypo_depth[:, 1] - hypo_depth[:, 0]).abs()
+            this_stage_trust_loss, _ = prior_trust_loss(
+                stage_inputs['trust_score'],
+                stage_inputs['mono_candidate_depth'],
+                stage_inputs['base_candidate_depth'],
+                depth_gt,
+                mask.unsqueeze(1) & stage_inputs['trust_valid_mask'],
+                candidate_interval,
+                temperature=trust_temperature,
+            )
+        else:
+            this_stage_trust_loss = depth_pred.sum() * 0.0
+
         # relative consistency loss for the last stage
         if stage_idx == 3:
             mono_depth = F.interpolate(mono_depth, size=depth_reg.shape[1:], mode='bilinear', align_corners=False)
             this_stage_mono_loss = relative_consistency_loss(depth_reg[mono_mask], mono_depth.squeeze(1)[mono_mask], sample_n=512*(4**stage_idx))
-            total_loss = total_loss + this_stage_ce_loss + 0.01 * this_stage_mono_loss
+            total_loss = (total_loss + this_stage_ce_loss + 0.01 * this_stage_mono_loss
+                          + trust_loss_weight * this_stage_trust_loss)
         else:
             this_stage_mono_loss = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
-            total_loss = total_loss + this_stage_ce_loss
+            total_loss = total_loss + this_stage_ce_loss + trust_loss_weight * this_stage_trust_loss
 
         stage_ce_loss.append(this_stage_ce_loss)
         stage_mono_loss.append(0.01 * this_stage_mono_loss)
+        stage_trust_loss.append(trust_loss_weight * this_stage_trust_loss)
 
-    return total_loss, stage_ce_loss, stage_mono_loss, range_err_ratio
+    return total_loss, stage_ce_loss, stage_mono_loss, stage_trust_loss, range_err_ratio
 
 
 def bld_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
@@ -241,7 +292,10 @@ def bld_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
     inverse = kwargs.get("inverse_depth", False)
     total_loss = torch.tensor(0.0, dtype=torch.float32, device=mask_ms["stage1"].device, requires_grad=False)
     stage_ce_loss = []
+    stage_trust_loss = []
     range_err_ratio = []
+    trust_loss_weight = kwargs.get("trust_loss_weight", 0.1)
+    trust_temperature = kwargs.get("trust_temperature", 1.0)
     for stage_idx, (stage_inputs, stage_key) in enumerate([(inputs[k], k) for k in inputs.keys() if "stage" in k]):
         depth_pred = stage_inputs['depth']
         hypo_depth = stage_inputs['hypo_depth']
@@ -270,8 +324,23 @@ def bld_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
         # cross-entropy
         this_stage_ce_loss = cross_entropy_loss(mask, hypo_depth, depth_gt, attn_weight)
 
+        if 'trust_score' in stage_inputs:
+            candidate_interval = (hypo_depth[:, 1] - hypo_depth[:, 0]).abs()
+            this_stage_trust_loss, _ = prior_trust_loss(
+                stage_inputs['trust_score'],
+                stage_inputs['mono_candidate_depth'],
+                stage_inputs['base_candidate_depth'],
+                depth_gt,
+                mask.unsqueeze(1) & stage_inputs['trust_valid_mask'],
+                candidate_interval,
+                temperature=trust_temperature,
+            )
+        else:
+            this_stage_trust_loss = depth_pred.sum() * 0.0
+
         stage_ce_loss.append(this_stage_ce_loss)
-        total_loss = total_loss + this_stage_ce_loss
+        stage_trust_loss.append(trust_loss_weight * this_stage_trust_loss)
+        total_loss = total_loss + this_stage_ce_loss + trust_loss_weight * this_stage_trust_loss
 
     depth_interval = hypo_depth[:, 0, :, :] - hypo_depth[:, 1, :, :]
 
@@ -281,7 +350,7 @@ def bld_loss(inputs, depth_gt_ms, mask_ms, **kwargs):
     err3 = (abs_err_scaled < 3).float().mean()
     err1 = (abs_err_scaled < 1).float().mean()
 
-    return total_loss, stage_ce_loss, range_err_ratio, epe, err3, err1
+    return total_loss, stage_ce_loss, stage_trust_loss, range_err_ratio, epe, err3, err1
 
 
 def cross_entropy_loss(mask_true, hypo_depth, depth_gt, attn_weight):

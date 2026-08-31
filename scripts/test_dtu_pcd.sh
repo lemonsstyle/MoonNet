@@ -8,7 +8,7 @@ PY_ARGS=${@:2}
 
 DTU_LOG_DIR="outputs/dtu_pcd"$exp
 if [ ! -d $DTU_LOG_DIR ]; then
-    mkdir -p $DTU_LOG_DIRm
+    mkdir -p $DTU_LOG_DIR
 fi
 DTU_OUT_DIR="outputs/dtu_pcd"$exp
 if [ ! -d $DTU_OUT_DIR ]; then
